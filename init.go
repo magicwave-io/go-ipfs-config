@@ -1,0 +1,273 @@
+package config
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"time"
+
+	"github.com/ipfs/interface-go-ipfs-core/options"
+	ci "github.com/libp2p/go-libp2p-core/crypto"
+	peer "github.com/libp2p/go-libp2p-core/peer"
+)
+
+func Init(out io.Writer, nBitsForKeypair int, routingType, ppChannelUrl string, commandPort int, torPath string, torDataDir string, torConfigPath string) (*Config, error) {
+	identity, err := CreateIdentity(out, []options.KeyGenerateOption{options.Key.Size(nBitsForKeypair)})
+	if err != nil {
+		return nil, err
+	}
+
+	return InitWithIdentity(identity, make([]string, 0), make([]string, 0), routingType, ppChannelUrl, commandPort, torPath, torDataDir, torConfigPath)
+}
+
+// , chunkSize int, chunkTimeout int
+func InitWithIdentity(identity Identity, announceAddrs []string, bootstrapAddrs []string, routingType, ppChannelUrl string, commandPort int, torPath string, torDataDir string, torConfigPath string) (*Config, error) {
+
+	var bootstrapPeers []peer.AddrInfo
+	var err error
+
+	datastore := DefaultDatastoreConfig()
+
+	if bootstrapAddrs == nil || len(bootstrapAddrs) == 0 {
+		bootstrapPeers, err = DefaultBootstrapPeers()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		bootstrapPeers, err = ParseBootstrapPeers(bootstrapAddrs)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	conf := &Config{
+		API: API{
+			HTTPHeaders: map[string][]string{},
+		},
+
+		// setup the node's default addresses.
+		// NOTE: two swarm listen addrs, one tcp, one utp.
+		Addresses: addressesConfig(announceAddrs),
+
+		Datastore: datastore,
+		Bootstrap: BootstrapPeerStrings(bootstrapPeers),
+		Identity:  identity,
+		Discovery: Discovery{
+			MDNS: MDNS{
+				Enabled:  true,
+				Interval: 10,
+			},
+		},
+
+		Routing: Routing{
+			Type: routingType, //"dht",
+		},
+
+		// setup the node mount points.
+		Mounts: Mounts{
+			IPFS: "/ipfs",
+			IPNS: "/ipns",
+		},
+
+		Ipns: Ipns{
+			ResolveCacheSize: 128,
+		},
+
+		Gateway: Gateway{
+			RootRedirect: "",
+			Writable:     false,
+			NoFetch:      false,
+			PathPrefixes: []string{},
+			HTTPHeaders: map[string][]string{
+				"Access-Control-Allow-Origin":  []string{"*"},
+				"Access-Control-Allow-Methods": []string{"GET"},
+				"Access-Control-Allow-Headers": []string{"X-Requested-With", "Range", "User-Agent"},
+			},
+			APICommands: []string{},
+		},
+		Reprovider: Reprovider{
+			Interval: "12h",
+			Strategy: "all",
+		},
+		Swarm: SwarmConfig{
+			ConnMgr: ConnMgr{
+				LowWater:    DefaultConnMgrLowWater,
+				HighWater:   DefaultConnMgrHighWater,
+				GracePeriod: DefaultConnMgrGracePeriod.String(),
+				Type:        "basic",
+			},
+		},
+		Pinning: Pinning{
+			RemoteServices: map[string]RemotePinningService{},
+		},
+		PPChannel: PPChannel{
+			CommandListenPort: commandPort,
+			ChannelUrl:        ppChannelUrl,
+		},
+		TorPath:                      torPath,
+		TorDataDir:                   torDataDir,
+		TorConfigPath:                torConfigPath,
+		FillChunkSize:                30,
+		FillChunkRetrievalTimeoutSec: 20,
+	}
+
+	return conf, nil
+}
+
+// DefaultConnMgrHighWater is the default value for the connection managers
+// 'high water' mark
+const DefaultConnMgrHighWater = 900
+
+// DefaultConnMgrLowWater is the default value for the connection managers 'low
+// water' mark
+const DefaultConnMgrLowWater = 600
+
+// DefaultConnMgrGracePeriod is the default value for the connection managers
+// grace period
+const DefaultConnMgrGracePeriod = time.Second * 20
+
+func addressesConfig(addresesToUseExternally []string) Addresses {
+
+	if addresesToUseExternally == nil || len(addresesToUseExternally) == 0 {
+		return Addresses{
+			Swarm: []string{
+				"/ip4/127.0.0.1/tcp/4001",
+			},
+			Announce:   []string{},
+			NoAnnounce: []string{},
+			API:        Strings{"/ip4/127.0.0.1/tcp/5001"},
+			Gateway:    Strings{"/ip4/127.0.0.1/tcp/18080"},
+		}
+	}
+
+	var addresses = Addresses{
+		Swarm: []string{
+			"/ip4/127.0.0.1/tcp/4001",
+		},
+		Announce:   []string{},
+		NoAnnounce: []string{},
+		API:        Strings{"/ip4/127.0.0.1/tcp/5001"},
+		Gateway:    Strings{"/ip4/127.0.0.1/tcp/18080"},
+	}
+
+	addresses.Swarm = append(addresses.Swarm, addresesToUseExternally...)
+	addresses.Announce = append(addresses.Announce, addresesToUseExternally...)
+
+	return addresses
+}
+
+// DefaultDatastoreConfig is an internal function exported to aid in testing.
+func DefaultDatastoreConfig() Datastore {
+	return Datastore{
+		StorageMax:         "10GB",
+		StorageGCWatermark: 90, // 90%
+		GCPeriod:           "1h",
+		BloomFilterSize:    0,
+		Spec:               flatfsSpec(),
+	}
+}
+
+func badgerSpec() map[string]interface{} {
+	return map[string]interface{}{
+		"type":   "measure",
+		"prefix": "badger.datastore",
+		"child": map[string]interface{}{
+			"type":       "badgerds",
+			"path":       "badgerds",
+			"syncWrites": false,
+			"truncate":   true,
+		},
+	}
+}
+
+func flatfsSpec() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "mount",
+		"mounts": []interface{}{
+			map[string]interface{}{
+				"mountpoint": "/blocks",
+				"type":       "measure",
+				"prefix":     "flatfs.datastore",
+				"child": map[string]interface{}{
+					"type":      "flatfs",
+					"path":      "blocks",
+					"sync":      true,
+					"shardFunc": "/repo/flatfs/shard/v1/next-to-last/2",
+				},
+			},
+			map[string]interface{}{
+				"mountpoint": "/",
+				"type":       "measure",
+				"prefix":     "leveldb.datastore",
+				"child": map[string]interface{}{
+					"type":        "levelds",
+					"path":        "datastore",
+					"compression": "none",
+				},
+			},
+		},
+	}
+}
+
+// CreateIdentity initializes a new identity.
+func CreateIdentity(out io.Writer, opts []options.KeyGenerateOption) (Identity, error) {
+	// TODO guard higher up
+	ident := Identity{}
+
+	settings, err := options.KeyGenerateOptions(opts...)
+	if err != nil {
+		return ident, err
+	}
+
+	var sk ci.PrivKey
+	var pk ci.PubKey
+
+	switch settings.Algorithm {
+	case "rsa":
+		if settings.Size == -1 {
+			settings.Size = options.DefaultRSALen
+		}
+
+		fmt.Fprintf(out, "generating %d-bit RSA keypair...", settings.Size)
+
+		priv, pub, err := ci.GenerateKeyPair(ci.RSA, settings.Size)
+		if err != nil {
+			return ident, err
+		}
+
+		sk = priv
+		pk = pub
+	case "ed25519":
+		if settings.Size != -1 {
+			return ident, fmt.Errorf("number of key bits does not apply when using ed25519 keys")
+		}
+		fmt.Fprintf(out, "generating ED25519 keypair...")
+		priv, pub, err := ci.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			return ident, err
+		}
+
+		sk = priv
+		pk = pub
+	default:
+		return ident, fmt.Errorf("unrecognized key type: %s", settings.Algorithm)
+	}
+	fmt.Fprintf(out, "done\n")
+
+	// currently storing key unencrypted. in the future we need to encrypt it.
+	// TODO(security)
+	skbytes, err := sk.Bytes()
+	if err != nil {
+		return ident, err
+	}
+	ident.PrivKey = base64.StdEncoding.EncodeToString(skbytes)
+
+	id, err := peer.IDFromPublicKey(pk)
+	if err != nil {
+		return ident, err
+	}
+	ident.PeerID = id.Pretty()
+	fmt.Fprintf(out, "peer identity: %s\n", ident.PeerID)
+	return ident, nil
+}
